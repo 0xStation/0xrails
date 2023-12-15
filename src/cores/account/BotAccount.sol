@@ -52,39 +52,10 @@ contract BotAccount is AccountRails, Ownable, Initializable {
     ===============*/
 
     /// @dev When evaluating signatures that don't contain the `VALIDATOR_FLAG`, authenticate only the owner
-    function _defaultValidateUserOp(UserOperation calldata userOp, bytes32 userOpHash, uint256 /*missingAccountFunds*/ )
-        internal
-        view
-        virtual
-        override
-        returns (bool)
-    {
-        // recover signer address and any error
-        (address signer, ECDSA.RecoverError err) = ECDSA.tryRecover(userOpHash, userOp.signature);
-        // return if signature is malformed
-        if (err != ECDSA.RecoverError.NoError) return false;
-        // return if signer is not owner
-        if (signer != owner()) return false;
+    function _isAuthorizedSigner(address _signer) internal view virtual override returns (bool) {
+        if (hasPermission(Operations.CALL_PERMIT, _signer)) return true;
 
-        return true;
-    }
-
-    /// @dev When evaluating signatures that don't contain the `VALIDATOR_FLAG`, authenticate only the owner
-    function _defaultIsValidSignature(bytes32 hash, bytes memory signature)
-        internal
-        view
-        virtual
-        override
-        returns (bool)
-    {
-        // support non-modular signatures by recovering signer address and reverting malleable or invalid signatures
-        (address signer, ECDSA.RecoverError err) = ECDSA.tryRecover(hash, signature);
-        // return if signature is malformed
-        if (err != ECDSA.RecoverError.NoError) return false;
-        // return if signer is not owner
-        if (signer != owner()) return false;
-
-        return true;
+        return false;
     }
 
     /// @notice This function must be overridden by contracts inheriting `Account` to delineate

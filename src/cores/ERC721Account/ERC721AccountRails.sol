@@ -60,7 +60,7 @@ contract ERC721AccountRails is AccountRails, ERC6551Account, Initializable, IERC
 
     /// @inheritdoc Account
     function withdrawFromEntryPoint(address payable recipient, uint256 amount) public virtual override {
-        if (!_isAuthorized(Operations.ADMIN, _msgSender())) {
+        if (!_isAuthorizedForOperation(Operations.ADMIN, _msgSender())) {
             revert IPermissions.PermissionDoesNotExist(Operations.ADMIN, _msgSender());
         }
 
@@ -71,40 +71,6 @@ contract ERC721AccountRails is AccountRails, ERC6551Account, Initializable, IERC
     function _checkSenderIsEntryPoint() internal virtual override {
         _updateState();
         super._checkSenderIsEntryPoint();
-    }
-
-    /// @dev When evaluating signatures that don't contain the `VALIDATOR_FLAG`, authenticate only the owner
-    function _defaultValidateUserOp(UserOperation calldata userOp, bytes32 userOpHash, uint256 /*missingAccountFunds*/ )
-        internal
-        view
-        virtual
-        override
-        returns (bool)
-    {
-        // recover signer address and any error
-        (address signer, ECDSA.RecoverError err) = ECDSA.tryRecover(userOpHash, userOp.signature);
-        // return if signature is malformed
-        if (err != ECDSA.RecoverError.NoError) return false;
-
-        // return true only if signer is owner, owner-delegated, or AccountGroup admin
-        return _isAuthorized(Operations.ADMIN, signer);
-    }
-
-    /// @dev When evaluating signatures that don't contain the `VALIDATOR_FLAG`, authenticate only the owner
-    function _defaultIsValidSignature(bytes32 hash, bytes memory signature)
-        internal
-        view
-        virtual
-        override
-        returns (bool)
-    {
-        // support non-modular signatures by recovering signer address and reverting malleable or invalid signatures
-        (address signer, ECDSA.RecoverError err) = ECDSA.tryRecover(hash, signature);
-        // return if signature is malformed
-        if (err != ECDSA.RecoverError.NoError) return false;
-
-        // return true only if signer is owner, owner-delegated, or AccountGroup admin
-        return _isAuthorized(Operations.ADMIN, signer);
     }
 
     function _isValidSigner(address signer, bytes memory) internal view override returns (bool) {
@@ -154,12 +120,19 @@ contract ERC721AccountRails is AccountRails, ERC6551Account, Initializable, IERC
     /// @dev Sensitive account operations restricted to three tiered authorization hierarchy:
     ///   TBA owner || TBA permission || AccountGroup admin
     /// This provides owner autonomy, owner-delegated permissions, and multichain AccountGroup management
-    function _isAuthorized(bytes8 _operation, address _sender) internal view returns (bool) {
+    function _isAuthorizedForOperation(bytes8 _operation, address _sender) internal view returns (bool) {
         // check sender is TBA owner or has been granted relevant permission (or admin) on this account
         if (hasPermission(_operation, _sender)) return true;
 
         // allow AccountGroup admins to manage accounts on non-origin chains
         return _isAccountGroupAdmin(_sender);
+    }
+
+    /// @dev Granting signature authorization can be achieved by adding the `CALL_PERMIT` permission to an account
+    function _isAuthorizedSigner(address _signer) internal view virtual override returns (bool) {
+        if (_isAuthorizedForOperation(Operations.CALL_PERMIT, _signer)) return true;
+
+        return false;
     }
 
     /// @dev On non-origin chains, `owner()` returns the zero address, so multichain upgrades
@@ -174,28 +147,28 @@ contract ERC721AccountRails is AccountRails, ERC6551Account, Initializable, IERC
 
     function _checkCanUpdateValidators() internal virtual override {
         _updateState();
-        if (!_isAuthorized(Operations.VALIDATOR, _msgSender())) {
+        if (!_isAuthorizedForOperation(Operations.VALIDATOR, _msgSender())) {
             revert IPermissions.PermissionDoesNotExist(Operations.VALIDATOR, _msgSender());
         }
     }
 
     function _checkCanUpdatePermissions() internal override {
         _updateState();
-        if (!_isAuthorized(Operations.PERMISSIONS, _msgSender())) {
+        if (!_isAuthorizedForOperation(Operations.PERMISSIONS, _msgSender())) {
             revert IPermissions.PermissionDoesNotExist(Operations.PERMISSIONS, _msgSender());
         }
     }
 
     function _checkCanUpdateGuards() internal override {
         _updateState();
-        if (!_isAuthorized(Operations.GUARDS, _msgSender())) {
+        if (!_isAuthorizedForOperation(Operations.GUARDS, _msgSender())) {
             revert IPermissions.PermissionDoesNotExist(Operations.GUARDS, _msgSender());
         }
     }
 
     function _checkCanUpdateInterfaces() internal override {
         _updateState();
-        if (!_isAuthorized(Operations.INTERFACE, _msgSender())) {
+        if (!_isAuthorizedForOperation(Operations.INTERFACE, _msgSender())) {
             revert IPermissions.PermissionDoesNotExist(Operations.INTERFACE, _msgSender());
         }
     }

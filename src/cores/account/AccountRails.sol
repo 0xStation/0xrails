@@ -12,6 +12,7 @@ import {Operations} from "src/lib/Operations.sol";
 import {Access} from "src/access/Access.sol";
 import {SupportsInterface} from "src/lib/ERC165/SupportsInterface.sol";
 import {ECDSA} from "openzeppelin-contracts/utils/cryptography/ECDSA.sol";
+import {SignatureChecker} from "openzeppelin-contracts/utils/cryptography/SignatureChecker.sol";
 import {IERC1271} from "openzeppelin-contracts/interfaces/IERC1271.sol";
 import {ERC1155Receiver} from "openzeppelin-contracts/token/ERC1155/utils/ERC1155Receiver.sol";
 import {IERC1155Receiver} from "openzeppelin-contracts/token/ERC1155/IERC1155Receiver.sol";
@@ -53,12 +54,12 @@ abstract contract AccountRails is Account, Rails, Validators, IERC1271 {
 
         bytes32 ethSignedUserOpHash = ECDSA.toEthSignedMessageHash(userOpHash);
 
-        // extract validator address using cheap calldata slicing before decoding
+        // try extracting packed validator data to check for modular validation format
         bytes8 flag = bytes8(userOp.signature[:8]);
         address validator = address(bytes20(userOp.signature[12:32]));
 
         if (flag == VALIDATOR_FLAG && isValidator(validator)) {
-            bytes memory formattedSig = userOp.signature[32:];
+            bytes calldata formattedSig = userOp.signature[32:];
 
             // copy userOp into memory and format for Validator module
             UserOperation memory formattedUserOp = userOp;
@@ -71,9 +72,19 @@ abstract contract AccountRails is Account, Rails, Validators, IERC1271 {
             if (ret != 0) return ret;
         } else {
             // support non-modular signatures by default
-            // authenticate signer, terminating early with status code 1 on failure
-            bool validSigner = _defaultValidateUserOp(userOp, ethSignedUserOpHash, missingAccountFunds);
-            if (!validSigner) return 1;
+            address signer;
+            bool validSig;
+            // check if `v == 0` instead of the standard 27/28, in which case it is a contract signature
+            if (userOp.signature[64] == 0) {
+                (signer, validSig) = _isValidContractSignature(userOpHash, userOp.signature);
+            } else {
+                (signer, validSig) = _isValidECDSASignature(userOpHash, userOp.signature);
+            }
+
+            // to save gas, terminate early if a signature or authorization error was encountered
+            if (!validSig || !_isAuthorizedSigner(signer)) {
+                return 1;
+            }
         }
 
         /// @notice BLS sig aggregator and timestamp expiry are not currently supported by this contract
@@ -98,45 +109,40 @@ abstract contract AccountRails is Account, Rails, Validators, IERC1271 {
     /// @dev Function to recover a signer address from the provided hash and signature
     /// and then verify whether the recovered signer address is a recognized Turnkey
     /// @param hash The 32 byte digest derived by hashing signed message data. Sadly, name is canonical in ERC1271.
-    /// @param signature The signature to be verified via recovery. Must be prepended with validator address
-    /// @notice To craft the signature, string concatenation or `abi.encodePacked` *must* be used
+    /// @param signature The signature to be verified via recovery. May be prepended with validator flag and address
+    /// @notice To craft the signature with prepend, string concatenation or `abi.encodePacked` *must* be used
     /// Zero-padded data will fail. Ie: `abi.encodePacked(validatorData, signer, currentRSV)` is correct
     /// @return magicValue The 4-byte value representing signature validity, as defined by EIP1271
     /// Can be one of three values:
     ///   - `this.isValidSignature.selector` indicates a valid signature
     ///   - `bytes4(hex'ffffffff')` indicates a signature failure bubbled up from an external modular validator
     ///   - `bytes4(0)` indicates a default signature failure, ie not using the modular `VALIDATOR_FLAG`
-    function isValidSignature(bytes32 hash, bytes memory signature) public view returns (bytes4 magicValue) {
-        // set start index
-        uint256 start = 0x20;
+    function isValidSignature(bytes32 hash, bytes calldata signature) public view returns (bytes4 magicValue) {
         // try extracting packed validator data to check for modular validation format
-        bytes32 data;
-        assembly {
-            data := mload(add(signature, start))
-        }
-        (bytes8 flag, address validator) = (bytes8(data), address(uint160(uint256(data))));
+        bytes8 flag = bytes8(signature[:8]);
+        address validator = address(bytes20(signature[12:32]));
 
         // collision of a signature's first 8 bytes with flag is very unlikely; impossible when incl validator address
         if (flag == VALIDATOR_FLAG && isValidator(validator)) {
-            uint256 len = signature.length - start;
-            bytes memory formattedSig = new bytes(len);
-
-            // copy relevant data into new bytes array, ie `abi.encodePacked(signer, nestedSig)`
-            for (uint256 i; i < len; ++i) {
-                formattedSig[i] = signature[start + i];
-            }
-
-            // format call for Validator module
+            bytes calldata formattedSig = signature[0x20:];
             bytes4 ret = IValidator(validator).isValidSignature(hash, formattedSig);
 
             // validator will return either correct `magicValue` or error code `INVALID_SIGNER`
             magicValue = ret;
         } else {
             // support non-modular signatures by default
-            // authenticate signer using overridden internal func
-            bool validSigner = _defaultIsValidSignature(hash, signature);
-            // return `bytes4(0)` if default signature validation also fails
-            magicValue = validSigner ? this.isValidSignature.selector : bytes4(0);
+            address signer;
+            bool validSig;
+            // check if `v == 0` instead of the standard 27/28, in which case it is a contract signature
+            if (signature[64] == 0) {
+                (signer, validSig) = _isValidContractSignature(hash, signature);
+            } else {
+                (signer, validSig) = _isValidECDSASignature(hash, signature);
+            }
+
+            if (validSig && _isAuthorizedSigner(signer)) {
+                magicValue = this.isValidSignature.selector;
+            }
         }
     }
 
@@ -144,21 +150,34 @@ abstract contract AccountRails is Account, Rails, Validators, IERC1271 {
         INTERNALS
     ===============*/
 
-    /// @dev Function to recover and authenticate a signer address in the context of `isValidSignature()`,
+    function _isAuthorizedSigner(address _signer) internal view virtual returns (bool);
+
+    /// @dev Recover and authenticate a signer address in the context of `isValidSignature()`,
     /// called only on signatures that were not constructed using the modular verification flag
     /// @notice Accounts do not express opinion on whether the `signer` is encoded into `userOp.signature`,
     /// so the OZ ECDSA library should be used rather than the SignatureChecker
-    function _defaultIsValidSignature(bytes32 hash, bytes memory signature) internal view virtual returns (bool);
+    function _isValidECDSASignature(bytes32 _hash, bytes memory _signature) internal view virtual returns (address _signer, bool _valid) {
+        // support non-modular signatures by recovering signer address and reverting malleable or invalid signatures
+        ECDSA.RecoverError err;
+        (_signer, err) = ECDSA.tryRecover(_hash, _signature);
+        
+        // return if signature is malformed
+        if (err == ECDSA.RecoverError.NoError) {
+            _valid = true;
+        }
+    }
 
-    /// @dev Function to recover and authenticate a signer address in the context of `validateUserOp()`,
-    /// called only on signatures that were not constructed using the modular verification flag
-    /// @notice Accounts do not express opinion on whether the `signer` is available, ie encoded into `userOp.signature`,
-    /// so the OZ ECDSA library should be used rather than the SignatureChecker
-    function _defaultValidateUserOp(UserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
-        internal
-        view
-        virtual
-        returns (bool);
+    /// @dev Smart contract signatures must provide a `v` value of 0 and abi encode the contract signer address into `r`
+    /// as well as provide an `s` value which is the current context's calldata offset where the originator's signature is located
+    /// In short, contract signatures follow this format: `abi.encodePacked(bytes32(signerAddress), uint256(sigOffset), uint8(0), bytes(sig))`
+    function _isValidContractSignature(bytes32 _hash, bytes calldata _signature) internal view virtual returns (address _signer, bool _valid) {
+        // for contract signatures, `_signer` refers to the contract whose address is encoded into `r` rather than signature originator
+        _signer = address(bytes20(_signature[12:32]));
+
+        uint256 offset = uint256(bytes32(_signature[32:64]));
+        bytes calldata _sig = _signature[offset:];
+        _valid = SignatureChecker.isValidERC1271SignatureNow(_signer, _hash, _sig);
+    }
 
     /// @dev View function to limit callers to only the EntryPoint contract of this chain
     function _checkSenderIsEntryPoint() internal virtual {

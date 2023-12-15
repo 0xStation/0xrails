@@ -34,10 +34,10 @@ contract CallPermitValidator is Validator {
         bytes6 validAfter;
         uint256 successData = uint256(bytes32(abi.encodePacked(authorizer, validUntil, validAfter)));
 
-        bytes memory signerData = userOp.signature[:20];
-        address signer = address((bytes20(signerData)));
-
-        bytes memory nestedSig = userOp.signature[20:];
+        // prepend is 20 since only signer remains prepended after processing validator flag
+        uint256 prepend = 20;
+        address signer = address(bytes20(userOp.signature[:prepend]));
+        bytes calldata nestedSig = userOp.signature[prepend:];
 
         // terminate if recovered signer address does not match packed signer
         if (!SignatureChecker.isValidSignatureNow(signer, userOpHash, nestedSig)) return SIG_VALIDATION_FAILED;
@@ -57,25 +57,16 @@ contract CallPermitValidator is Validator {
     /// @param signature The signature to be recovered and verified
     /// @notice The top level call context to an `Account` implementation must prepend
     /// an additional 32-byte word packed with the `VALIDATOR_FLAG` and this address
-    function isValidSignature(bytes32 msgHash, bytes memory signature)
+    function isValidSignature(bytes32 msgHash, bytes calldata signature)
         external
         view
         virtual
         returns (bytes4 magicValue)
     {
-        bytes32 signerData;
-        assembly {
-            signerData := mload(add(signature, 0x20))
-        }
-        address signer = address(bytes20(signerData));
-
-        // start is now 20th index since only signer is prepended
-        uint256 start = 20;
-        uint256 len = signature.length - start;
-        bytes memory nestedSig = new bytes(len);
-        for (uint256 i; i < len; ++i) {
-            nestedSig[i] = signature[start + i];
-        }
+        // prepend is 20 since only signer remains prepended after processing validator flag
+        uint256 prepend = 20;
+        address signer = address(bytes20(signature[:prepend]));
+        bytes calldata nestedSig = signature[prepend:];
 
         // use SignatureChecker to evaluate `signer` and `nestedSig`
         bool validSig = SignatureChecker.isValidSignatureNow(signer, msgHash, nestedSig);
